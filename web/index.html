@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Live Caption Mic</title>
+    <title>Live Caption Mic + Audio Metrics</title>
     <style>
         body {
             font-family: -apple-system, BlinkMacSystemFont, sans-serif;
@@ -42,6 +42,14 @@
             line-height: 1.5;
             white-space: pre-wrap;
         }
+        #metrics {
+            margin-top: 16px;
+            padding: 12px;
+            background: #2a2a2a;
+            border-radius: 8px;
+            font-family: monospace;
+            font-size: 13px;
+        }
         .interim { color: #aaa; font-style: italic; }
         #server-input {
             width: 100%;
@@ -57,135 +65,268 @@
     </style>
 </head>
 <body>
-    <h1>🎤 Live Caption Mic</h1>
+    <h1>🎤 Live Caption Mic + Metrics</h1>
 
-    <label for="server-input">Server URL (e.g. http://192.168.1.10:3000):</label>
-    <input id="server-input" type="text" placeholder="http://YOUR-LAPTOP-IP:3000">
+    <label for="server-input">Server URL (e.g. https://stt-relay-xyz.onrender.com):</label>
+    <input id="server-input" type="text" placeholder="https://stt-relay-xyz.onrender.com">
 
     <div>
-        <button id="start" onclick="startRecognition()">Start</button>
-        <button id="stop" onclick="stopRecognition()" disabled>Stop</button>
+        <button id="start" onclick="startAll()">Start</button>
+        <button id="stop" onclick="stopAll()" disabled>Stop</button>
     </div>
 
     <div id="status">Idle.</div>
     <div id="transcript"></div>
+    <div id="metrics">Metrics: not running</div>
 
     <script>
-        const startBtn      = document.getElementById("start");
-        const stopBtn       = document.getElementById("stop");
-        const statusEl      = document.getElementById("status");
-        const transcriptEl  = document.getElementById("transcript");
-        const serverInput   = document.getElementById("server-input");
+    // ─────────────────────────────────────────────────────────────────────────
+    // SETUP
+    // ─────────────────────────────────────────────────────────────────────────
 
-        // Persist server URL in localStorage so user doesn't have to retype
-        serverInput.value = localStorage.getItem("stt_server") || "";
-        serverInput.addEventListener("change", () => {
-            localStorage.setItem("stt_server", serverInput.value.trim());
-        });
+    const startBtn      = document.getElementById("start");
+    const stopBtn       = document.getElementById("stop");
+    const statusEl      = document.getElementById("status");
+    const transcriptEl  = document.getElementById("transcript");
+    const metricsEl     = document.getElementById("metrics");
+    const serverInput   = document.getElementById("server-input");
 
-        // Web Speech API (Chrome / Edge / Android Chrome)
-        const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-        if (!SR) {
-            statusEl.textContent = "ERROR: Web Speech API not supported in this browser. Use Chrome.";
-            startBtn.disabled = true;
+    serverInput.value = localStorage.getItem("stt_server") || "";
+    serverInput.addEventListener("change", () => {
+        localStorage.setItem("stt_server", serverInput.value.trim());
+    });
+
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) {
+        statusEl.textContent = "ERROR: Web Speech API not supported. Use Chrome.";
+        startBtn.disabled = true;
+    }
+
+    // Speech recognition state
+    let recognition = null;
+    let finalTranscript = "";
+    let lastUploaded = "";
+
+    // Audio analysis state
+    let audioContext = null;
+    let analyserNode = null;
+    let mediaStream = null;
+    let analysisTimer = null;
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // PUBLIC API: start / stop everything together
+    // ─────────────────────────────────────────────────────────────────────────
+
+    async function startAll() {
+        const serverUrl = serverInput.value.trim();
+        if (!serverUrl) { alert("Enter the server URL first."); return; }
+        localStorage.setItem("stt_server", serverUrl);
+
+        try {
+            // Get mic stream once, share between speech recognition AND analyser
+            mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        } catch (err) {
+            statusEl.textContent = "Mic access denied: " + err.message;
+            return;
         }
 
-        let recognition = null;
-        let finalTranscript = "";
-        let lastUploaded = "";
-        let uploadTimer = null;
+        startAudioAnalysis(mediaStream);
+        startSpeechRecognition();
 
-        function startRecognition() {
-            const serverUrl = serverInput.value.trim();
-            if (!serverUrl) {
-                alert("Please enter the server URL first.");
-                return;
+        startBtn.disabled = true;
+        stopBtn.disabled  = false;
+    }
+
+    function stopAll() {
+        stopSpeechRecognition();
+        stopAudioAnalysis();
+        if (mediaStream) {
+            mediaStream.getTracks().forEach(t => t.stop());
+            mediaStream = null;
+        }
+        startBtn.disabled = false;
+        stopBtn.disabled  = true;
+        statusEl.textContent = "Stopped.";
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // AUDIO ANALYSIS — Web Audio API
+    // ─────────────────────────────────────────────────────────────────────────
+    //
+    // Uses an AnalyserNode to get FFT frequency data each frame.
+    // We split the spectrum into 8 bands (matching Spectacles' AudioAnalyzer)
+    // and compute overall amplitude. Posts to backend at ~10 Hz.
+
+    const NUM_BANDS = 8;
+    const FFT_SIZE  = 256;          // gives 128 frequency bins
+    const POST_INTERVAL_MS = 100;   // 10 Hz upload rate
+
+    function startAudioAnalysis(stream) {
+        audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        const source  = audioContext.createMediaStreamSource(stream);
+        analyserNode  = audioContext.createAnalyser();
+        analyserNode.fftSize = FFT_SIZE;
+        analyserNode.smoothingTimeConstant = 0.4;
+        source.connect(analyserNode);
+        // We do NOT connect to destination — we don't want to play mic back to user
+
+        const freqData = new Uint8Array(analyserNode.frequencyBinCount); // 128
+        const timeData = new Uint8Array(analyserNode.fftSize);
+
+        analysisTimer = setInterval(() => {
+            analyserNode.getByteFrequencyData(freqData);
+            analyserNode.getByteTimeDomainData(timeData);
+
+            // Amplitude (RMS of time-domain signal, normalised 0-1)
+            // timeData values are 0-255 with 128 = silence.
+            let sumSq = 0;
+            for (let i = 0; i < timeData.length; i++) {
+                const v = (timeData[i] - 128) / 128;
+                sumSq += v * v;
             }
-            localStorage.setItem("stt_server", serverUrl);
+            const rms = Math.sqrt(sumSq / timeData.length);
+            // Boost: speech RMS is typically 0.05-0.15. Scale up so values
+            // approximate Spectacles' AudioAnalyzer range (which is 0-1+).
+            const amplitude = Math.min(rms * 3, 1.0);
 
-            recognition = new SR();
-            recognition.continuous = true;
-            recognition.interimResults = true;
-            recognition.lang = "en-US";
+            // 8 frequency bands — average freqData bins into 8 groups
+            // Bin 0 = ~0 Hz, last bin = ~Nyquist (sampleRate/2, ~24kHz typically)
+            // We use a log-ish split: smaller bands at low freq, larger at high
+            // to approximate mel-scale weighting used by Spectacles AudioAnalyzer
+            const bands = melLikeBands(freqData, NUM_BANDS);
 
-            recognition.onstart = () => {
-                statusEl.textContent = "Listening...";
-                startBtn.disabled = true;
-                stopBtn.disabled  = false;
-            };
+            // Show on page for debugging
+            metricsEl.textContent =
+                "Amp: " + amplitude.toFixed(2) + "  |  Bands: [" +
+                bands.map(b => b.toFixed(2)).join(", ") + "]";
 
-            recognition.onerror = (e) => {
-                statusEl.textContent = "Error: " + e.error;
-            };
+            // POST to backend
+            uploadMetrics(amplitude, bands);
+        }, POST_INTERVAL_MS);
+    }
 
-            recognition.onend = () => {
-                statusEl.textContent = "Stopped.";
-                startBtn.disabled = false;
-                stopBtn.disabled  = true;
-                // Auto-restart if user didn't intentionally stop
-                if (recognition && recognition._userStopped !== true) {
-                    setTimeout(() => {
-                        try { recognition.start(); } catch (_) {}
-                    }, 500);
-                }
-            };
+    function stopAudioAnalysis() {
+        if (analysisTimer) { clearInterval(analysisTimer); analysisTimer = null; }
+        if (audioContext)  { audioContext.close(); audioContext = null; }
+        analyserNode = null;
+        metricsEl.textContent = "Metrics: not running";
+    }
 
-            recognition.onresult = (event) => {
-                let interim = "";
-                for (let i = event.resultIndex; i < event.results.length; i++) {
-                    const result = event.results[i];
-                    if (result.isFinal) {
-                        finalTranscript += result[0].transcript + " ";
-                    } else {
-                        interim += result[0].transcript;
-                    }
-                }
-                renderTranscript(finalTranscript, interim);
-
-                // Upload latest text (debounced via setInterval below)
-                const fullText = (finalTranscript + interim).trim();
-                if (fullText && fullText !== lastUploaded) {
-                    uploadText(fullText);
-                    lastUploaded = fullText;
-                }
-            };
-
-            recognition._userStopped = false;
-            recognition.start();
+    // Split FFT bins into 8 mel-scale-like bands (more low-frequency resolution)
+    // Returns array of 8 floats in 0-1 range.
+    function melLikeBands(freqData, numBands) {
+        const numBins = freqData.length;
+        // Logarithmic edges from bin 1 to bin (numBins-1)
+        const edges = [];
+        for (let i = 0; i <= numBands; i++) {
+            const t = i / numBands;
+            // log curve: low values cover few bins, high values cover many
+            const binIndex = Math.floor(Math.pow(numBins - 1, t));
+            edges.push(binIndex);
         }
 
-        function stopRecognition() {
-            if (recognition) {
-                recognition._userStopped = true;
-                recognition.stop();
+        const out = [];
+        for (let b = 0; b < numBands; b++) {
+            const start = edges[b];
+            const end   = Math.max(edges[b + 1], start + 1);
+            let sum = 0, count = 0;
+            for (let i = start; i < end && i < numBins; i++) {
+                sum += freqData[i];
+                count++;
             }
+            const avg = count > 0 ? sum / count / 255.0 : 0;
+            out.push(avg);
         }
+        return out;
+    }
 
-        function renderTranscript(finalText, interimText) {
-            transcriptEl.innerHTML =
-                escapeHTML(finalText) +
-                '<span class="interim">' + escapeHTML(interimText) + '</span>';
-        }
+    // Upload metrics to backend (fire-and-forget)
+    function uploadMetrics(amplitude, bands) {
+        const serverUrl = serverInput.value.trim();
+        if (!serverUrl) return;
+        fetch(serverUrl + "/metrics", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ amplitude, bands })
+        }).catch(() => { /* silent on failure */ });
+    }
 
-        function escapeHTML(s) {
-            return s.replace(/[&<>"']/g, c => ({
-                "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
-            }[c]));
-        }
+    // ─────────────────────────────────────────────────────────────────────────
+    // SPEECH RECOGNITION
+    // ─────────────────────────────────────────────────────────────────────────
 
-        async function uploadText(text) {
-            const serverUrl = serverInput.value.trim();
-            if (!serverUrl) return;
-            try {
-                await fetch(serverUrl + "/upload", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ text })
-                });
-            } catch (err) {
-                statusEl.textContent = "Upload error: " + err.message;
+    function startSpeechRecognition() {
+        recognition = new SR();
+        recognition.continuous = true;
+        recognition.interimResults = true;
+        recognition.lang = "en-US";
+
+        recognition.onstart = () => {
+            statusEl.textContent = "Listening + analysing...";
+        };
+
+        recognition.onerror = (e) => {
+            statusEl.textContent = "Error: " + e.error;
+        };
+
+        recognition.onend = () => {
+            if (recognition && recognition._userStopped !== true) {
+                setTimeout(() => {
+                    try { recognition.start(); } catch (_) {}
+                }, 500);
             }
+        };
+
+        recognition.onresult = (event) => {
+            let interim = "";
+            for (let i = event.resultIndex; i < event.results.length; i++) {
+                const result = event.results[i];
+                if (result.isFinal) finalTranscript += result[0].transcript + " ";
+                else interim += result[0].transcript;
+            }
+            renderTranscript(finalTranscript, interim);
+
+            const fullText = (finalTranscript + interim).trim();
+            if (fullText && fullText !== lastUploaded) {
+                uploadText(fullText);
+                lastUploaded = fullText;
+            }
+        };
+
+        recognition._userStopped = false;
+        recognition.start();
+    }
+
+    function stopSpeechRecognition() {
+        if (recognition) {
+            recognition._userStopped = true;
+            recognition.stop();
         }
+    }
+
+    function renderTranscript(finalText, interimText) {
+        transcriptEl.innerHTML =
+            escapeHTML(finalText) +
+            '<span class="interim">' + escapeHTML(interimText) + '</span>';
+    }
+
+    function escapeHTML(s) {
+        return s.replace(/[&<>"']/g, c => ({
+            "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+        }[c]));
+    }
+
+    async function uploadText(text) {
+        const serverUrl = serverInput.value.trim();
+        if (!serverUrl) return;
+        try {
+            await fetch(serverUrl + "/upload", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ text })
+            });
+        } catch (err) { /* silent */ }
+    }
     </script>
 </body>
 </html>
